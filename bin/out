@@ -1,0 +1,63 @@
+#!/bin/bash
+
+set -e
+set -o pipefail
+exec 3>&1 # use fd 3 for script output
+exec 1>&2 # send normal stdout to stderr for logging
+
+payload="$(mktemp "$TMPDIR/k8s-resource-request.XXXXXX")"
+cat > "$payload" <&0
+
+cd $1
+
+SERVICE_ACCOUNT_KEY=$(jq -r .source.service_account.key < "$payload")
+SERVICE_ACCOUNT_EMAIL=$(jq -r .source.service_account.email < "$payload")
+PROJECT_ID=$(jq -r .source.project_id < "$payload")
+ZONE=$(jq -r .source.zone < "$payload")
+CLUSTER=$(jq -r .source.cluster < "$payload")
+
+export NAMESPACE=$(jq -r .params.namespace < "$payload")
+export TYPE=$(jq -r .params.type < "$payload")
+export NAME=$(jq -r .params.name < "$payload")
+export CONTAINER=$(jq -r .params.container < "$payload")
+IMAGE_FILE=$(jq -r .params.image_file < "$payload")
+TAG_FILE=$(jq -r .params.tag_file < "$payload")
+DEPLOY_HOOK=$(jq -r '.params.deploy_hook // ""' < "$payload")
+
+if [ ! -f "${IMAGE_FILE}" ]; then
+  echo "${IMAGE_FILE} not found"
+  exit 1
+fi
+if [ ! -f "${TAG_FILE}" ]; then
+  echo "${TAG_FILE} not found"
+  exit 1
+fi
+export IMAGE=$(cat ${IMAGE_FILE})
+export TAG=$(cat ${TAG_FILE})
+
+# Setup access
+echo $SERVICE_ACCOUNT_KEY > /gcloud-service-key.json
+
+gcloud auth activate-service-account ${SERVICE_ACCOUNT_EMAIL} --key-file /gcloud-service-key.json --project ${PROJECT_ID}
+gcloud config set container/cluster ${CLUSTER}
+gcloud config set compute/zone ${ZONE}
+gcloud container clusters get-credentials ${CLUSTER}
+
+kubectl set image ${TYPE}/${NAME} ${CONTAINER}=${IMAGE}:${TAG} --namespace ${NAMESPACE}
+
+if [ -x "${DEPLOY_HOOK}" ]; then
+  ${DEPLOY_HOOK}
+fi
+
+VERSION=${ZONE}/${CLUSTER}/${TYPE}/${NAME}/${IMAGE}:${TAG}
+jq -n "{
+  version: { ref: $(echo ${VERSION} | jq -R .) },
+  metadata: [
+    { name: \"zone\", value: $(echo ${ZONE} | jq -R .) },
+    { name: \"cluster\", value: $(echo ${CLUSTER} | jq -R .) },
+    { name: \"type\", value: $(echo ${TYPE} | jq -R .) },
+    { name: \"name\", value: $(echo ${NAME} | jq -R .) },
+    { name: \"image\", value: $(echo ${IMAGE} | jq -R .) },
+    { name: \"tag\", value: $(echo ${TAG} | jq -R .) }
+  ]
+}" >&3
